@@ -1,12 +1,5 @@
-"""
-02_shp_to_json.py
-Iterates through the '04_Shape' folders in the Pandan Raste directory
-and converts Line and Polygon shapefiles to GeoJSON format.
-"""
-
+import geopandas as gpd
 from pathlib import Path
-# import geopandas as gpd  # Uncomment if using geopandas
-# import arcpy             # Uncomment if using arcpy
 
 def convert_shp_to_geojson(root_path):
     root_dir = Path(root_path)
@@ -19,7 +12,7 @@ def convert_shp_to_geojson(root_path):
                     shape_folder = village / "Pandan_Georeff" / "04_Shape"
                     
                     if shape_folder.exists() and shape_folder.is_dir():
-                        print(f"Processing: {shape_folder}")
+                        print(f"\nProcessing: {shape_folder}")
                         
                         for shp_file in shape_folder.glob("*.shp"):
                             geojson_name = shp_file.with_suffix('.geojson').name
@@ -28,11 +21,8 @@ def convert_shp_to_geojson(root_path):
                             print(f"  Converting: {shp_file.name} -> {geojson_name}")
                             
                             try:
-                                # ----------------------------------------------------
-                                # INSERT YOUR CONVERSION LOGIC HERE (e.g., geopandas)
-                                # gdf = gpd.read_file(shp_file)
-                                # gdf.to_file(geojson_path, driver='GeoJSON')
-                                # ----------------------------------------------------
+                                gdf = gpd.read_file(shp_file)
+                                gdf.to_file(geojson_path, driver='GeoJSON')
                                 print("    -> Success!")
                             except Exception as e:
                                 print(f"    -> Failed! Error: {e}")
