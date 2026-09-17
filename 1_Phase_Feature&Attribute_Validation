@@ -1,0 +1,232 @@
+import arcpy
+import os
+import csv
+import re
+import tkinter as tk
+from tkinter import filedialog
+from collections import Counter
+import pandas as pd
+
+arcpy.env.overwriteOutput = True
+
+# -------------------------------
+# 👉 Folder Selection
+# -------------------------------
+root = tk.Tk()
+root.withdraw()
+
+input_folder = filedialog.askdirectory(title="Select Input Folder (Pandan Raste Root)")
+output_folder = filedialog.askdirectory(title="Select Output Folder")
+excel_file = filedialog.askopenfilename(title="Select External Excel", filetypes=[("Excel files", "*.xlsx *.xls")])
+
+if not input_folder or not output_folder or not excel_file:
+    print("❌ Input missing. Exiting...")
+    raise SystemExit
+
+os.makedirs(output_folder, exist_ok=True)
+output_csv = os.path.join(output_folder, "QC_Final_Report.csv")
+
+# -------------------------------
+# 👉 Read External Excel
+# -------------------------------
+df = pd.read_excel(excel_file)
+external_data = {}
+
+for _, row in df.iterrows():
+    try:
+        # Convert to string, remove decimals (e.g. 544546.0 -> "544546"), and strip whitespace
+        code = str(row["LGD_CODE"]).split('.')[0].strip()
+        external_data[code] = {
+            "last_pin": int(row["last_pin"]) if pd.notna(row["last_pin"]) else "-",
+            "pin_count": int(row["pin_count"]) if pd.notna(row["pin_count"]) else "-",
+            "last_part": int(row["last_part"]) if pd.notna(row["last_part"]) else "-"
+        }
+    except Exception:
+        continue
+
+# -------------------------------
+# 👉 Scan Folders 
+# -------------------------------
+report = {}
+# Regex to cleanly capture the "544546_VillageName" part of the file
+file_pattern = re.compile(r"^(\d{6}_.*)_(polygons|Lines)\.shp$", re.IGNORECASE)
+
+for root_dir, dirs, files in os.walk(input_folder):
+    for file in files:
+        match = file_pattern.match(file)
+        if match:
+            village_full = match.group(1) # e.g., "544546_Choramba (Nanded)"
+            layer_type = match.group(2).lower() # "polygons" or "lines"
+            
+            report.setdefault(village_full, {})
+            full_path = os.path.join(root_dir, file)
+            
+            if layer_type == "polygons":
+                report[village_full]["polygon"] = full_path
+            elif layer_type == "lines":
+                report[village_full]["road"] = full_path
+
+# -------------------------------
+# 👉 QC RUN
+# -------------------------------
+final_rows = []
+
+for village_full, layers in report.items():
+    print(f"Processing: {village_full}")
+
+    # 👉 Split village prefix
+    parts = village_full.split("_", 1)
+    if len(parts) == 2:
+        lgd_code = parts[0]
+        village_name = parts[1]
+    else:
+        lgd_code = village_full
+        village_name = village_full
+
+    row = {
+        "LGD_CODE": lgd_code,
+        "Village Name": village_name,
+        "Polygon Status": "Missing",
+        "Road Status": "Missing",
+        "Road NULL": 0,
+        "Road Invalid": 0,
+        "ROAD_TYPE_A": 0,
+        "ROAD_TYPE_B": 0,
+        "ROAD_TYPE_C": 0,
+        "Total TEXT": 0,
+        "Duplicate TEXT": 0,
+        "Missing TEXT Count": 0,
+        "Details": ""
+    }
+
+    details = []
+
+    # ---------------- POLYGON QC ----------------
+    if "polygon" in layers and arcpy.Exists(layers["polygon"]):
+        row["Polygon Status"] = "Present"
+        fc = layers["polygon"]
+
+        try:
+            fields = [f.name for f in arcpy.ListFields(fc)]
+            text_field = next((f for f in fields if f.lower().startswith("text")), None)
+
+            if text_field:
+                vals = []
+                with arcpy.da.SearchCursor(fc, [text_field]) as cur:
+                    for r in cur:
+                        if r[0] is not None:
+                            try:
+                                vals.append(int(r[0]))
+                            except ValueError:
+                                pass
+
+                if vals:
+                    row["Total TEXT"] = len(vals)
+                    cnt = Counter(vals)
+                    dup = [str(k) for k, v in cnt.items() if v > 1]
+                    row["Duplicate TEXT"] = len(dup)
+
+                    if dup:
+                        details.append("Duplicate:" + ",".join(dup))
+
+                    full = set(range(min(vals), max(vals)+1))
+                    miss = sorted(list(full - set(vals)))
+                    row["Missing TEXT Count"] = len(miss)
+
+                    if miss:
+                        details.append("Missing:" + ",".join(map(str, miss)))
+                else:
+                    details.append("No valid TEXT")
+            else:
+                details.append("TEXT field missing")
+        except Exception as e:
+            details.append(f"Polygon error: {str(e)[:30]}")
+    else:
+        details.append("Polygon missing")
+
+    # ---------------- ROAD QC ----------------
+    if "road" in layers and arcpy.Exists(layers["road"]):
+        row["Road Status"] = "Present"
+        fc = layers["road"]
+
+        try:
+            if arcpy.Exists("road_lyr"):
+                arcpy.Delete_management("road_lyr")
+
+            arcpy.MakeFeatureLayer_management(fc, "road_lyr")
+            
+            # Verify ROAD_TYPE field exists to prevent query crashes
+            road_fields = [f.name for f in arcpy.ListFields(fc)]
+            if "ROAD_TYPE" in road_fields:
+                arcpy.SelectLayerByAttribute_management("road_lyr", "NEW_SELECTION", "ROAD_TYPE IS NULL")
+                row["Road NULL"] = int(arcpy.GetCount_management("road_lyr")[0])
+
+                arcpy.SelectLayerByAttribute_management("road_lyr", "NEW_SELECTION", "ROAD_TYPE NOT IN ('A','B','C')")
+                row["Road Invalid"] = int(arcpy.GetCount_management("road_lyr")[0])
+
+                for t in ["A", "B", "C"]:
+                    arcpy.SelectLayerByAttribute_management("road_lyr", "NEW_SELECTION", f"ROAD_TYPE = '{t}'")
+                    row[f"ROAD_TYPE_{t}"] = int(arcpy.GetCount_management("road_lyr")[0])
+            else:
+                details.append("ROAD_TYPE field missing")
+                
+            arcpy.Delete_management("road_lyr")
+        except Exception as e:
+            details.append(f"Road error: {str(e)[:30]}")
+    else:
+        details.append("Road missing")
+
+    # ---------------- CALCULATION ----------------
+    row["Total Count"] = row["Total TEXT"] + row["Missing TEXT Count"]
+
+    # ---------------- MATCH ----------------
+    if lgd_code in external_data:
+        row["last_pin"] = external_data[lgd_code]["last_pin"]
+        row["pin_count"] = external_data[lgd_code]["pin_count"]
+        row["last_part"] = external_data[lgd_code]["last_part"]
+    else:
+        row["last_pin"] = "-"
+        row["pin_count"] = "-"
+        row["last_part"] = "-"
+
+    # ---------------- STATUS ----------------
+    if row["last_pin"] != "-" and row["Total Count"] == row["last_pin"]:
+        row["Status"] = "MATCH"
+    else:
+        row["Status"] = "NOT MATCH"
+
+    # ---------------- QC STATUS ----------------
+    if (
+        row["Duplicate TEXT"] == 0 and
+        row["Missing TEXT Count"] == 0 and
+        row["last_pin"] != "-" and
+        row["Total Count"] == row["last_pin"]
+    ):
+        row["QC Status"] = "DONE"
+    else:
+        row["QC Status"] = "QC REQUIRED"
+
+    row["Details"] = " | ".join(details) if details else "-"
+    final_rows.append(row)
+
+# -------------------------------
+# 👉 SAVE CSV (Unicode FIX)
+# -------------------------------
+with open(output_csv, "w", newline="", encoding="utf-8-sig") as f:
+    writer = csv.writer(f)
+
+    header = [
+        "LGD_CODE", "Village Name",
+        "Polygon Status", "Road Status",
+        "Road NULL", "Road Invalid",
+        "ROAD_TYPE_A", "ROAD_TYPE_B", "ROAD_TYPE_C",
+        "Total TEXT", "Duplicate TEXT", "Missing TEXT Count", "Details",
+        "Total Count", "last_pin", "pin_count", "last_part",
+        "Status", "QC Status"
+    ]
+
+    writer.writerow(header)
+    for r in final_rows:
+        writer.writerow([r.get(h, "") for h in header])
+
+print(f"\n🔥 FINAL QC SYSTEM RUN SUCCESSFULLY. Report saved at: {output_csv}")
